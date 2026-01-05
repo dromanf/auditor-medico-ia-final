@@ -9,12 +9,13 @@ from dotenv import load_dotenv
 # 1. CARGAR CONFIGURACIÓN
 load_dotenv()
 
-# Inicializar cliente de Groq
+# Inicializar cliente de Groq con la API Key del archivo .env
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 app = FastAPI()
 
 # 2. CONFIGURAR CORS
+# Permite que tu frontend en localhost:3000 se comunique con este backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -23,12 +24,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- CONFIGURACIÓN DE RUTAS PARA VERCEL ---
-# Esto localiza el CSV sin importar si ejecutas desde / o desde /backend
+# --- CONFIGURACIÓN DE RUTAS LOCALES ---
+# Define la ruta absoluta para encontrar el CSV en la carpeta backend
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(BASE_DIR, "clean.csv")
 
-# 3. GESTIÓN DE MEMORIA Y DATOS
+# 3. GESTIÓN DE MEMORIA Y MODELOS DE DATOS
 historial_clinico = []
 
 class ConsultaMedica(BaseModel):
@@ -37,7 +38,7 @@ class ConsultaMedica(BaseModel):
 
 def obtener_protocolo_csv(nombre_examen_usuario):
     """
-    Busca de forma flexible el examen en el archivo clean.csv usando rutas absolutas
+    Busca de forma flexible el examen en el archivo clean.csv
     """
     try:
         if not os.path.exists(CSV_PATH):
@@ -47,7 +48,7 @@ def obtener_protocolo_csv(nombre_examen_usuario):
         df = pd.read_csv(CSV_PATH)
         busqueda = nombre_examen_usuario.lower().strip()
         
-        # Filtro flexible
+        # Filtro flexible para encontrar coincidencias parciales
         filtro = df['Nombre del Examen'].str.lower().str.contains(busqueda, na=False)
         resultado = df[filtro]
         
@@ -58,67 +59,72 @@ def obtener_protocolo_csv(nombre_examen_usuario):
         print(f"Error procesando el CSV: {e}")
         return None
 
-# 4. RUTA PRINCIPAL
+# 4. RUTA PRINCIPAL DE VALIDACIÓN
 @app.post("/validar")
 async def validar_consulta(datos: ConsultaMedica):
     try:
-        # A. Buscar información en tu base de datos (CSV) con la nueva ruta
+        # A. Buscar información en la base de datos local (CSV)
         info_csv = obtener_protocolo_csv(datos.examen)
         
         if info_csv:
             contexto_reglas = f"""
-            REGLAS OFICIALES DEL SEGURO PARA ESTE EXAMEN:
-            - Nombre exacto: {info_csv['Nombre del Examen']}
+            REGLAS OFICIALES DEL SEGURO (CSV):
+            - Examen: {info_csv['Nombre del Examen']}
             - Costo: ${info_csv['Costo']}
             - Especialidad: {info_csv['Especialidad']}
-            - Protocolo de Aplicación: {info_csv['Protocolo']}
+            - Protocolo: {info_csv['Protocolo']}
             """
         else:
-            contexto_reglas = "ADVERTENCIA: El examen solicitado no figura en el listado oficial de costos y protocolos."
+            contexto_reglas = "ADVERTENCIA: El examen no está en el catálogo oficial de costos, pero debe evaluarse clínicamente."
 
-        # B. Contexto de Memoria
+        # B. Contexto de Memoria (Para conectar síntomas previos)
         contexto_memoria = ""
         if historial_clinico:
-            ultimos = historial_clinico[-2:]
+            ultimos = historial_clinico[-3:] # Tomamos los últimos 3 registros
             contexto_memoria = "HISTORIAL RECIENTE DEL PACIENTE:\n" + "\n".join(
-                [f"- Síntomas previos: {h['sintomas']} | Examen previo: {h['examen']}" for h in ultimos]
+                [f"- Síntomas: {h['sintomas']} | Examen: {h['examen']}" for h in ultimos]
             )
 
-        # C. Construcción del Prompt
+        # C. Construcción del Prompt con Enfoque Diagnóstico
         prompt_sistema = f"""
-        Eres un Auditor Médico Experto. Tu función es evaluar si un examen es pertinente basándote en protocolos.
-        
+        Eres un Auditor Médico Experto con capacidad de diagnóstico diferencial. 
+        Tu trabajo no es solo validar costos, sino evaluar la pertinencia clínica profunda.
+
         {contexto_reglas}
         
         {contexto_memoria}
 
-        INSTRUCCIONES DE FORMATO:
-        Debes responder de forma estructurada con estos encabezados exactos:
-        ESTADO: [PROCEDENTE o ALERTA]
-        ANÁLISIS TÉCNICO: (Justificación basada en el Protocolo del CSV y coherencia clínica)
-        PARA EL PACIENTE: (Explicación sencilla)
-        RESUMEN ECONÓMICO: (Menciona el costo del CSV y si se justifica el gasto)
+        INSTRUCCIONES DE ANÁLISIS:
+        1. Evalúa la relación entre síntomas y el examen solicitado.
+        2. Realiza una inferencia diagnóstica (qué enfermedades podrían causar estos síntomas).
+        3. Si el examen no es el ideal, sugiere cuál sería el 'Gold Standard' médico.
+
+        FORMATO DE RESPUESTA (Estricto):
+        ESTADO: [PROCEDENTE, ALERTA o RECHAZADO]
+        ANÁLISIS TÉCNICO: (Análisis médico detallado, sospechas diagnósticas y justificación del protocolo)
+        PARA EL PACIENTE: (Explicación empática y clara sobre su salud y la necesidad del examen)
+        RESUMEN ECONÓMICO: (Menciona costos del CSV y si el gasto está justificado clínicamente)
         """
 
         prompt_usuario = f"SÍNTOMAS ACTUALES: {datos.sintomas}\nEXAMEN SOLICITADO: {datos.examen}"
 
-        # D. Llamada a Groq
+        # D. Llamada a la IA (Groq)
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": prompt_sistema},
                 {"role": "user", "content": prompt_usuario}
             ],
-            temperature=0.1
+            temperature=0.2 # Un poco más de creatividad para el diagnóstico
         )
 
         respuesta_ia = completion.choices[0].message.content
 
-        # E. Actualizar Memoria
+        # E. Actualizar Memoria para futuras consultas
         historial_clinico.append({"sintomas": datos.sintomas, "examen": datos.examen})
 
         return {"respuesta": respuesta_ia}
 
     except Exception as e:
-        print(f"ERROR EN EL SERVIDOR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+        print(f"ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
